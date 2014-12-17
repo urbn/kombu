@@ -50,6 +50,7 @@ TRANSPORT_ALIASES = {
     'redis': 'kombu.transport.redis:Transport',
     'SQS': 'kombu.transport.SQS:Transport',
     'sqs': 'kombu.transport.SQS:Transport',
+    'emq': 'kombu.transport.ElasticMQ.Transport',
     'beanstalk': 'kombu.transport.beanstalk:Transport',
     'mongodb': 'kombu.transport.mongodb:Transport',
     'couchdb': 'kombu.transport.couchdb:Transport',
