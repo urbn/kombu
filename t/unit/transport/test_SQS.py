@@ -486,3 +486,21 @@ class test_Channel:
             QueueUrl=message['sqs_queue'],
             ReceiptHandle=message['sqs_message']['ReceiptHandle']
         )
+
+    def test_get_fanout(self):
+
+        queue = 'foobar'
+        self.channel.exchange_declare('fanout_exchange', type='fanout')
+        self.channel._queue_bind('fanout_exchange', 'foo', '*', queue)
+
+        assert queue in self.channel._broadcast_cursors
+
+        self.set_broadcast_return_value('foobar', {
+            '_id': 'docId1', 'payload': '{"some": "data"}',
+        })
+
+        event = self.channel._get('foobar')
+        assert event == {'some': 'data'}
+
+        with pytest.raises(Empty):
+            self.channel._get('foobar')

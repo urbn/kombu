@@ -85,8 +85,14 @@ class Channel(virtual.Channel):
     domain_format = 'kombu%(vhost)s'
     _asynsqs = None
     _sqs = None
+    _sns = None
+    _fanout_queues = {}
+    _fanout_subscriptions = {}
     _queue_cache = {}
     _noack_queues = set()
+
+    fanout_prefix = True
+    fanout_patterns = False
 
     def __init__(self, *args, **kwargs):
         if boto3 is None:
@@ -100,6 +106,15 @@ class Channel(virtual.Channel):
         self._update_queue_cache(self.queue_name_prefix)
 
         self.hub = kwargs.get('hub') or get_event_loop()
+        self.active_fanout_queues = set()
+        self._fanout_to_queue = {}
+
+        if self.fanout_prefix:
+            if isinstance(self.fanout_prefix, string_t):
+                self.keyprefix_fanout = self.fanout_prefix
+        else:
+            self.keyprefix_fanout = ''
+
 
     def _update_queue_cache(self, queue_name_prefix):
         resp = self.sqs.list_queues(QueueNamePrefix=queue_name_prefix)
@@ -121,6 +136,29 @@ class Channel(virtual.Channel):
             queue = self._tag_to_queue[consumer_tag]
             self._noack_queues.discard(queue)
         return super(Channel, self).basic_cancel(consumer_tag)
+
+    def _get_publish_topic(self, exchange, routing_key):
+        if routing_key and self.fanout_patterns:
+            return ''.join([self.keyprefix_fanout, exchange, '/', routing_key])
+        return ''.join([self.keyprefix_fanout, exchange])
+
+    def _get_subscribe_topic(self, queue):
+        exchange, routing_key = self._fanout_queues[queue]
+        return self._get_publish_topic(exchange, routing_key)
+
+    def _subscribe(self):
+        c = self.sns
+
+        for queue in self.active_fanout_queues:
+            topic = self._get_subscribe_topic(queue)
+            subscription = c.subscribe(TopicArn=topic, Protocol='sqs', Endpoint=queue,
+                                       ReturnSubscriptionArn=True)
+            self._fanout_subscriptions[queue] = subscription
+
+    def _unsubscribe_from(self, queue):
+        subscription = self._fanout_subscriptions(queue)
+        c = self.sns
+        c.unsubscribe(SubscriptionArn=subscription)
 
     def drain_events(self, timeout=None, callback=None, **kwargs):
         """Return a single payload message from one of our queues.
@@ -203,6 +241,71 @@ class Channel(virtual.Channel):
         super(Channel, self)._delete(queue)
         self._queue_cache.pop(queue, None)
 
+    def _new_topic(self, topic_name, **kwargs):
+        """Ensure a topic with given name exists in SNS."""
+        resp = self.sns.get_all_topics()
+        for topic in resp.get('Topics', []):
+            return topic.get('TopicArn')
+        while resp.get('NextToken'):
+            resp = self.sns.get_all_topics(
+                NextToken=resp.get('NextToken')
+            )
+            for topic in resp.get('Topics', []):
+                return topic.get('TopicArn')
+        attributes = {}
+        resp = self._create_topic(topic_name, attributes)
+        return resp.get('TopicArn')
+
+    def _create_topic(self, topic_name, attributes):
+        """Create an SNS topic with a given name."""
+        # Allow specifying additional boto create_topic Attributes
+        # via transport options
+        attributes.update(
+            self.transport_options.get('sns-creation-attributes') or {},
+        )
+
+        return self.sns.create_topic(
+            Name=topic_name,
+            Attributes=attributes,
+        )
+
+    def _new_subscription(self, topic_name, queue, **kwargs):
+
+        topic_arn = self._new_topic(topic_name)
+        queue_url = self._new_queue(queue)
+        attributes = {}
+        subscription = self._create_subscription(topic_arn, queue_url, attributes)
+        return subscription.get('SubscriptionARN')
+
+    def _create_subscription(self, topic_arn, queue_url, attributes):
+        # Allow specifying additional boto topic.subscribe Attributes
+        # via transport options
+        attributes.update(
+            self.transport_options.get('sns-subscription-creation-attributes') or {},
+        )
+        topic = self.sns.Topic(topic_arn)
+        subscription =  topic.subscribe(
+            Protocol='sqs',
+            Endpoint=queue_url,
+            Attributes=attributes,
+            ReturnSubscriptionARN=True,
+        )
+
+        self.sqs.add_permission(
+            QueueURL=queue_url,
+            Label='fanout.%s' % queue_url,
+            AWSAccountIds=[topic_arn],
+            Actions=['SendMessage'],
+        )
+        return subscription
+
+    def _queue_bind(self, exchange, routing_key, pattern, queue):
+        topic_name = self._get_publish_topic(exchange, routing_key),
+        if self.typeof(exchange).type == 'fanout':
+            self._new_subscription(topic_name, queue)
+            self._fanout_queues[queue] = exchange
+
+
     def _put(self, queue, message, **kwargs):
         """Put message onto queue."""
         q_url = self._new_queue(queue)
@@ -227,6 +330,14 @@ class Channel(virtual.Channel):
             )
         else:
             self.sqs.send_message(**kwargs)
+
+    def _put_fanout(self, exchange, message, routing_key, **kwargs):
+        """Deliver fanout message."""
+        with self.conn_or_acquire() as client:
+            self.sns.publish(
+                self._get_publish_topic(exchange, routing_key),
+                dumps(message),
+            )
 
     def _message_to_python(self, message, queue_name, queue):
         try:
@@ -449,6 +560,23 @@ class Channel(virtual.Channel):
         return self._sqs
 
     @property
+    def sns(self):
+        if self._sns is None:
+            session = boto3.session.Session(
+                region_name=self.region,
+                aws_access_key_id=self.conninfo.userid,
+                aws_secret_access_key=self.conninfo.password,
+            )
+            is_secure = self.is_secure if self.is_secure is not None else True
+            client_kwargs = {
+                'use_ssl': is_secure
+            }
+            if self.endpoint_url is not None:
+                client_kwargs['endpoint_url'] = self.endpoint_url
+            self._sns = session.client('sns', **client_kwargs)
+        return self._sns
+
+    @property
     def asynsqs(self):
         if self._asynsqs is None:
             self._asynsqs = AsyncSQSConnection(
@@ -476,7 +604,7 @@ class Channel(virtual.Channel):
 
     @cached_property
     def supports_fanout(self):
-        return False
+        return True
 
     @cached_property
     def region(self):
@@ -563,7 +691,7 @@ class Transport(virtual.Transport):
 
     implements = virtual.Transport.implements.extend(
         asynchronous=True,
-        exchange_type=frozenset(['direct']),
+        exchange_type=frozenset(['direct', 'fanout']),
     )
 
     @property
