@@ -243,15 +243,17 @@ class Channel(virtual.Channel):
 
     def _new_topic(self, topic_name, **kwargs):
         """Ensure a topic with given name exists in SNS."""
-        resp = self.sns.get_all_topics()
+        resp = self.sns.list_topics()
         for topic in resp.get('Topics', []):
-            return topic.get('TopicArn')
+            if topic_name == topic.get('TopicArn', '').split(':'):
+                return topic.get('TopicArn')
         while resp.get('NextToken'):
-            resp = self.sns.get_all_topics(
+            resp = self.sns.list_topics(
                 NextToken=resp.get('NextToken')
             )
             for topic in resp.get('Topics', []):
-                return topic.get('TopicArn')
+                if topic_name == topic.get('TopicArn', '').split(':'):
+                    return topic.get('TopicArn')
         attributes = {}
         resp = self._create_topic(topic_name, attributes)
         return resp.get('TopicArn')
@@ -265,8 +267,7 @@ class Channel(virtual.Channel):
         )
 
         return self.sns.create_topic(
-            Name=topic_name,
-            Attributes=attributes,
+            Name=topic_name
         )
 
     def _new_subscription(self, topic_name, queue, **kwargs):
@@ -275,7 +276,7 @@ class Channel(virtual.Channel):
         queue_url = self._new_queue(queue)
         attributes = {}
         subscription = self._create_subscription(topic_arn, queue_url, attributes)
-        return subscription.get('SubscriptionARN')
+        return subscription.arn
 
     def _create_subscription(self, topic_arn, queue_url, attributes):
         # Allow specifying additional boto topic.subscribe Attributes
@@ -283,28 +284,38 @@ class Channel(virtual.Channel):
         attributes.update(
             self.transport_options.get('sns-subscription-creation-attributes') or {},
         )
-        topic = self.sns.Topic(topic_arn)
-        subscription =  topic.subscribe(
+        sns = boto3.resource('sns')
+        topic = sns.Topic(topic_arn)
+        sqs = boto3.resource('sqs')
+        queue = sqs.Queue(queue_url)
+        queue_arn = queue.attributes.get('QueueArn')
+        subscription = topic.subscribe(
             Protocol='sqs',
-            Endpoint=queue_url,
-            Attributes=attributes,
-            ReturnSubscriptionARN=True,
+            Endpoint=queue_arn
         )
 
-        self.sqs.add_permission(
-            QueueURL=queue_url,
-            Label='fanout.%s' % queue_url,
-            AWSAccountIds=[topic_arn],
-            Actions=['SendMessage'],
-        )
+        import json
+        policy = dict(Version='2012-10-17')
+        policy['Statement'] = [{
+            'Action': 'SQS:SendMessage',
+            'Effect': 'Allow',
+            'Principal': {'AWS': '*'},
+            'Resource': queue_arn,
+            'Sid': str(uuid.uuid4()),
+            'Condition': {'StringLike': {'aws:SourceArn': topic_arn}}
+        }]
+        queue.set_attributes(Attributes={'Policy': json.dumps(policy)})
         return subscription
 
     def _queue_bind(self, exchange, routing_key, pattern, queue):
-        topic_name = self._get_publish_topic(exchange, routing_key),
+        topic_name = self._get_publish_topic(exchange, routing_key)
         if self.typeof(exchange).type == 'fanout':
             self._new_subscription(topic_name, queue)
             self._fanout_queues[queue] = exchange
+            # need to store subscriptions and queue link somewhere
 
+    def get_table(self):
+        pass
 
     def _put(self, queue, message, **kwargs):
         """Put message onto queue."""
@@ -333,11 +344,12 @@ class Channel(virtual.Channel):
 
     def _put_fanout(self, exchange, message, routing_key, **kwargs):
         """Deliver fanout message."""
-        with self.conn_or_acquire() as client:
-            self.sns.publish(
-                self._get_publish_topic(exchange, routing_key),
-                dumps(message),
-            )
+        topic_name = self._get_publish_topic(exchange, routing_key)
+        topic_arn = self._new_topic(topic_name)
+        self.sns.publish(
+            TopicArn=topic_arn,
+            Message=dumps(message),
+        )
 
     def _message_to_python(self, message, queue_name, queue):
         try:

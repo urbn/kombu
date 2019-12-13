@@ -19,6 +19,7 @@ from kombu import Connection, Exchange, Queue
 
 from kombu.five import Empty
 from kombu.transport import SQS
+from kombu.utils.url import quote
 
 SQS_Channel_sqs = SQS.Channel.sqs
 
@@ -504,3 +505,35 @@ class test_Channel:
 
         with pytest.raises(Empty):
             self.channel._get('foobar')
+
+
+@skip.unless_module('boto3')
+class test_Channel_Fanout:
+
+    def setup(self):
+        """Mock the back-end SQS classes"""
+        # Sanity check... if SQS is None, then it did not import and we
+        # cannot execute our tests.
+        SQS.Channel._queue_cache.clear()
+
+        broker_url = '{}://{}:{}@'.format(
+            SQS.Transport.driver_type,
+            quote('XX', safe=""),
+            quote('XX', safe="")
+        )
+        self.connection = Connection(broker_url, transport_options=dict(region='us-east-1'))
+        self.channel = self.connection.channel()
+
+
+    def test_basic_publish(self):
+
+        queue = 'A15-DEV-KERSH-RC-TEST'
+        exchange = 'FANOUT-TOPIC'
+        routing_key = 'R_KEY'
+
+        self.channel.keyprefix_fanout = 'A15_DEV_KERSH'
+
+        m = self.channel.prepare_message('restart')
+        self.channel.exchange_declare(exchange, type='fanout')
+        self.channel.queue_bind(queue, exchange, routing_key)
+        self.channel.basic_publish(m, exchange, routing_key)
