@@ -36,11 +36,10 @@ SQS Features supported by this transport:
 from __future__ import absolute_import, unicode_literals
 
 import base64
+import os
 import socket
 import string
 import uuid
-
-from vine import transform, ensure_promise, promise
 
 from kombu.asynchronous import get_event_loop
 from kombu.asynchronous.aws.ext import boto3, exceptions
@@ -52,6 +51,7 @@ from kombu.utils import scheduling
 from kombu.utils.encoding import bytes_to_str, safe_str
 from kombu.utils.json import loads, dumps
 from kombu.utils.objects import cached_property
+from vine import transform, ensure_promise, promise
 
 from . import virtual
 
@@ -91,6 +91,8 @@ class Channel(virtual.Channel):
     _queue_cache = {}
     _noack_queues = set()
 
+    keyprefix_fanout = None
+
     fanout_prefix = True
     fanout_patterns = False
 
@@ -106,15 +108,14 @@ class Channel(virtual.Channel):
         self._update_queue_cache(self.queue_name_prefix)
 
         self.hub = kwargs.get('hub') or get_event_loop()
-        self.active_fanout_queues = set()
         self._fanout_to_queue = {}
+        self.active_fanout_queues = set()
+        self.auto_delete_queues = set()
 
         if self.fanout_prefix:
-            if isinstance(self.fanout_prefix, string_t):
-                self.keyprefix_fanout = self.fanout_prefix
+            self.keyprefix_fanout = os.environ.get('KOMBU_FANOUT_KEY_PREFIX', 'kombu_fanout_')
         else:
             self.keyprefix_fanout = ''
-
 
     def _update_queue_cache(self, queue_name_prefix):
         resp = self.sqs.list_queues(QueueNamePrefix=queue_name_prefix)
@@ -122,14 +123,30 @@ class Channel(virtual.Channel):
             queue_name = url.split('/')[-1]
             self._queue_cache[queue_name] = url
 
-    def basic_consume(self, queue, no_ack, *args, **kwargs):
+    def basic_consume(self, queue, no_ack, callback, consumer_tag, **kwargs):
         if no_ack:
             self._noack_queues.add(queue)
         if self.hub:
             self._loop1(queue)
-        return super(Channel, self).basic_consume(
-            queue, no_ack, *args, **kwargs
-        )
+
+        def _callback(raw_message):
+            if raw_message.get('Message'):
+                # unwrap SNS message
+                raw_message = loads(raw_message.get('Message'))
+            message = self.Message(raw_message, channel=self)
+            if not no_ack:
+                self.qos.append(message, message.delivery_tag)
+            return callback(message)
+
+        self._tag_to_queue[consumer_tag] = queue
+        self._active_queues.append(queue)
+
+        self.connection._callbacks[queue] = _callback
+        self._consumers.add(consumer_tag)
+
+        self._reset_cycle()
+
+        return
 
     def basic_cancel(self, consumer_tag):
         if consumer_tag in self._consumers:
@@ -198,7 +215,7 @@ class Channel(virtual.Channel):
     def canonical_queue_name(self, queue_name):
         return self.entity_name(self.queue_name_prefix + queue_name)
 
-    def _new_queue(self, queue, **kwargs):
+    def _new_queue(self, queue, auto_delete=False, **kwargs):
         """Ensure a queue with given name exists in SQS."""
         if not isinstance(queue, string_t):
             return queue
@@ -311,10 +328,9 @@ class Channel(virtual.Channel):
         topic_name = self._get_publish_topic(exchange, routing_key)
         if self.typeof(exchange).type == 'fanout':
             self._new_subscription(topic_name, queue)
-            self._fanout_queues[queue] = exchange
-            # need to store subscriptions and queue link somewhere
+        self._fanout_queues[queue] = exchange
 
-    def get_table(self):
+    def get_table(self, exchange):
         pass
 
     def _put(self, queue, message, **kwargs):
@@ -352,10 +368,13 @@ class Channel(virtual.Channel):
         )
 
     def _message_to_python(self, message, queue_name, queue):
-        try:
-            body = base64.b64decode(message['Body'].encode())
-        except TypeError:
-            body = message['Body'].encode()
+
+        body_raw = message['Body']
+        body_decoded = base64.b64decode(body_raw)
+        if body_raw == base64.b64encode(body_decoded):
+            body = body_decoded.encode()
+        else:
+            body = body_raw.encode()
         payload = loads(bytes_to_str(body))
         if queue_name in self._noack_queues:
             queue = self._new_queue(queue_name)
@@ -692,11 +711,11 @@ class Transport(virtual.Transport):
     wait_time_seconds = 0
     default_port = None
     connection_errors = (
-        virtual.Transport.connection_errors +
-        (exceptions.BotoCoreError, socket.error)
+            virtual.Transport.connection_errors +
+            (exceptions.BotoCoreError, socket.error)
     )
     channel_errors = (
-        virtual.Transport.channel_errors + (exceptions.BotoCoreError,)
+            virtual.Transport.channel_errors + (exceptions.BotoCoreError,)
     )
     driver_type = 'sqs'
     driver_name = 'sqs'
