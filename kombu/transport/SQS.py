@@ -420,8 +420,8 @@ class Channel(virtual.Channel):
         return super(Channel, self)._restore(message)
 
     def basic_ack(self, delivery_tag):
-        delivery_info = self.qos.get(delivery_tag).delivery_info
         try:
+            delivery_info = self.qos.get(delivery_tag).delivery_info
             queue = delivery_info['sqs_queue']
         except KeyError:
             pass
