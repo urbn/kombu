@@ -41,10 +41,11 @@ import socket
 import string
 import uuid
 
-from kombu.asynchronous import get_event_loop
+from kombu.asynchronous import get_event_loop, set_event_loop, Hub
 from kombu.asynchronous.aws.ext import boto3, exceptions
 from kombu.asynchronous.aws.sqs.connection import AsyncSQSConnection
 from kombu.asynchronous.aws.sqs.message import AsyncMessage
+from kombu.exceptions import InconsistencyError
 from kombu.five import Empty, range, string_t, text_t
 from kombu.log import get_logger
 from kombu.utils import scheduling
@@ -66,6 +67,13 @@ CHARS_REPLACE_TABLE[0x2e] = 0x2d  # '.' -> '-'
 
 #: SQS bulk get supports a maximum of 10 messages at a time.
 SQS_MAX_MESSAGES = 10
+
+NO_ROUTE_ERROR = """
+Cannot route message for exchange {0!r}: Table empty or key no longer exists.
+Probably the key ({1!r}) has been removed from the AWS.
+"""
+
+_global_exchange_queues = {}
 
 
 def maybe_int(x):
@@ -90,7 +98,9 @@ class Channel(virtual.Channel):
     _fanout_subscriptions = {}
     _queue_cache = {}
     _noack_queues = set()
+    _exchange_queues = _global_exchange_queues
 
+    keyprefix_queue = '_kombu.binding.%s'
     keyprefix_fanout = None
 
     fanout_prefix = True
@@ -108,6 +118,10 @@ class Channel(virtual.Channel):
         self._update_queue_cache(self.queue_name_prefix)
 
         self.hub = kwargs.get('hub') or get_event_loop()
+        if not self.hub:
+            hub = Hub()
+            set_event_loop(hub)
+            self.hub = get_event_loop()
         self._fanout_to_queue = {}
         self.active_fanout_queues = set()
         self.auto_delete_queues = set()
@@ -288,7 +302,6 @@ class Channel(virtual.Channel):
         )
 
     def _new_subscription(self, topic_name, queue, **kwargs):
-
         topic_arn = self._new_topic(topic_name)
         queue_url = self._new_queue(queue)
         attributes = {}
@@ -328,10 +341,17 @@ class Channel(virtual.Channel):
         topic_name = self._get_publish_topic(exchange, routing_key)
         if self.typeof(exchange).type == 'fanout':
             self._new_subscription(topic_name, queue)
-        self._fanout_queues[queue] = exchange
+            self._fanout_queues[queue] = exchange
+        self._exchange_queues[self.keyprefix_queue % (exchange)] = "~".join([routing_key or '',
+                                                                             pattern or '',
+                                                                             queue or ''])
 
     def get_table(self, exchange):
-        pass
+        key = self.keyprefix_queue % exchange
+        values = [self._exchange_queues.get(key)]
+        if not values:
+            raise InconsistencyError(NO_ROUTE_ERROR.format(exchange, key))
+        return [tuple(bytes_to_str(val).split("~")) for val in values]
 
     def _put(self, queue, message, **kwargs):
         """Put message onto queue."""
@@ -368,7 +388,6 @@ class Channel(virtual.Channel):
         )
 
     def _message_to_python(self, message, queue_name, queue):
-
         body_raw = message['Body']
         body_decoded = base64.b64decode(body_raw)
         if body_raw == base64.b64encode(body_decoded):

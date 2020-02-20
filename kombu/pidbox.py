@@ -3,7 +3,6 @@ from __future__ import absolute_import, unicode_literals
 
 import socket
 import warnings
-
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from copy import copy
@@ -17,10 +16,10 @@ from .common import maybe_declare, oid_from
 from .exceptions import InconsistencyError
 from .five import range, string_t
 from .log import get_logger
+from .matcher import match
 from .utils.functional import maybe_evaluate, reprcall
 from .utils.objects import cached_property
 from .utils.uuid import uuid
-from .matcher import match
 
 REPLY_QUEUE_EXPIRES = 10
 
@@ -72,6 +71,7 @@ class Node(object):
         def verify_exclusive(name, messages, consumers):
             if consumers:
                 warnings.warn(W_PIDBOX_IN_USE.format(node=self))
+
         queue.on_declared = verify_exclusive
 
         return Consumer(
@@ -142,7 +142,16 @@ class Node(object):
         else:
             run_dispatch = True
         if run_dispatch:
+            if body.get('reply_to'):
+                exchange = body.get('reply_to').get("exchange")
+                routing_key = body.get('reply_to').get("routing_key")
+                queue = '%s.%s' % (routing_key, exchange)
+                self.channel._exchange_queues[self.channel.keyprefix_queue % exchange] = "~".join([routing_key or '',
+                                                                                                   '',
+                                                                                                   queue or ''])
+
             return self.dispatch(**body)
+
     dispatch_from_message = handle_message
 
     def reply(self, data, exchange, routing_key, ticket, **kwargs):
@@ -155,7 +164,7 @@ class Mailbox(object):
     """Process Mailbox."""
 
     node_cls = Node
-    exchange_fmt = '%s.pidbox'
+    exchange_fmt = '%s_pidbox'
     reply_exchange_fmt = 'reply.%s.pidbox'
 
     #: Name of application.
