@@ -36,6 +36,7 @@ SQS Features supported by this transport:
 from __future__ import absolute_import, unicode_literals
 
 import base64
+import binascii
 import os
 import socket
 import string
@@ -388,12 +389,11 @@ class Channel(virtual.Channel):
         )
 
     def _message_to_python(self, message, queue_name, queue):
-        body_raw = message['Body']
-        body_decoded = base64.b64decode(body_raw)
-        if body_raw == base64.b64encode(body_decoded):
-            body = body_decoded.encode()
-        else:
-            body = body_raw.encode()
+        try:
+            encoded_body = message['Body'].encode()
+            body = base64.b64decode(encoded_body, validate=True)
+        except (TypeError, binascii.Error):
+            body = message['Body'].encode()
         payload = loads(bytes_to_str(body))
         if queue_name in self._noack_queues:
             queue = self._new_queue(queue_name)
