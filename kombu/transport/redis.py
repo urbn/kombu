@@ -89,7 +89,7 @@ def get_redis_error_classes():
             OSError,
             exceptions.ConnectionError,
             exceptions.AuthenticationError,
-            getattr(exceptions, 'TimeoutError', None))))),
+            getattr(exceptions, 'south_south_TimeoutError', None))))),
         (virtual.Transport.channel_errors + (
             DataError,
             exceptions.InvalidResponse,
@@ -395,9 +395,6 @@ class Channel(virtual.Channel):
     visibility_timeout = 3600   # 1 hour
     priority_steps = PRIORITY_STEPS
     socket_timeout = None
-    socket_connect_timeout = None
-    socket_keepalive = None
-    socket_keepalive_options = None
     max_connections = 10
     #: Transport option to enable disable fanout keyprefix.
     #: Should be enabled by default, but that is not
@@ -427,10 +424,6 @@ class Channel(virtual.Channel):
          'fanout_prefix',
          'fanout_patterns',
          'socket_timeout',
-         'socket_connect_timeout',
-         'socket_keepalive',
-         'socket_keepalive_options',
-         'queue_order_strategy',
          'max_connections',
          'priority_steps')  # <-- do not add comma here!
     )
@@ -808,46 +801,22 @@ class Channel(virtual.Channel):
                     ))
         return vhost
 
-    def _filter_tcp_connparams(self, socket_keepalive=None,
-                               socket_keepalive_options=None, **params):
-        return params
-
-    def _connparams(self, async=False, _r210_options=(
-            'socket_connect_timeout', 'socket_keepalive',
-            'socket_keepalive_options')):
+    def _connparams(self, async=False):
         conninfo = self.connection.client
-        connparams = {
-            'host': conninfo.hostname or '127.0.0.1',
-            'port': conninfo.port or DEFAULT_PORT,
-            'virtual_host': conninfo.virtual_host,
-            'password': conninfo.password,
-            'max_connections': self.max_connections,
-            'socket_timeout': self.socket_timeout,
-            'socket_connect_timeout': self.socket_connect_timeout,
-            'socket_keepalive': self.socket_keepalive,
-            'socket_keepalive_options': self.socket_keepalive_options,
-        }
-        if redis.VERSION < (2, 10):
-            for param in _r210_options:
-                val = connparams.pop(param, None)
-                if val is not None:
-                    raise VersionMismatch(
-                        'redis: {0!r} requires redis 2.10.0 or higher'.format(
-                            param))
+        connparams = {'host': conninfo.hostname or '127.0.0.1',
+                      'port': conninfo.port or DEFAULT_PORT,
+                      'virtual_host': conninfo.virtual_host,
+                      'password': conninfo.password,
+                      'max_connections': self.max_connections,
+                      'socket_timeout': self.socket_timeout}
         host = connparams['host']
         if '://' in host:
             scheme, _, _, _, password, path, query = _parse_url(host)
             if scheme == 'socket':
-                connparams = self._filter_tcp_connparams(**connparams)
                 connparams.update({
                     'connection_class': redis.UnixDomainSocketConnection,
                     'path': '/' + path,
                     'password': password}, **query)
-
-                connparams.pop('socket_connect_timeout', None)
-                connparams.pop('socket_keepalive', None)
-                connparams.pop('socket_keepalive_options', None)
-
             connparams.pop('host', None)
             connparams.pop('port', None)
         connparams['db'] = self._prepare_virtual_host(

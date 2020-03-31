@@ -63,7 +63,7 @@ class ConsumerMixin(object):
 
             def get_consumers(self, Consumer, channel):
                 return [Consumer(queues=[self.task_queue],
-                                 callbacks=[self.on_task])]
+                                 callback=[self.on_task])]
 
             def on_task(self, body, message):
                 print('Got task: {0!r}'.format(body))

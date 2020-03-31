@@ -7,25 +7,19 @@ slightly.
 
 from __future__ import absolute_import
 
-import sys
-
 from kombu import Connection
 from kombu import messaging
 from kombu import five
 from kombu.tests.case import Case, SkipTest
 import kombu
 
-
-if sys.version_info[0] >= 3:
-    SQS, skip_reason = None, 'boto does not support Python 3'  # noqa
-else:
-    try:
-        from kombu.transport import SQS
-    except ImportError:
-        # Boto must not be installed if the SQS transport fails to import,
-        # so we skip all unit tests. Set SQS to None here, and it will be
-        # checked during the setUp() phase later.
-        SQS, skip_reason = None, 'boto not installed'  # noqa
+try:
+    from kombu.transport import SQS
+except ImportError:
+    # Boto must not be installed if the SQS transport fails to import,
+    # so we skip all unit tests. Set SQS to None here, and it will be
+    # checked during the setUp() phase later.
+    SQS = None
 
 
 class SQSQueueMock(object):
@@ -104,7 +98,7 @@ class test_Channel(Case):
         # Sanity check... if SQS is None, then it did not import and we
         # cannot execute our tests.
         if SQS is None:
-            raise SkipTest(skip_reason)
+            raise SkipTest('Boto is not installed')
 
         SQS.Channel._queue_cache.clear()
 
