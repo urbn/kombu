@@ -65,9 +65,6 @@ class test_Broadcast(Case):
         self.assertEqual(q.name, 'explicit_queue_name')
         self.assertEqual(q.exchange.name, 'test_Broadcast')
 
-        q2 = q(Mock())
-        self.assertEqual(q2.name, q.name)
-
 
 class test_maybe_declare(Case):
 
